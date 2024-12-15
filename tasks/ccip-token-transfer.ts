@@ -1,135 +1,187 @@
 import { task } from "hardhat/config";
 import { HardhatRuntimeEnvironment, TaskArguments } from "hardhat/types";
-import { getPrivateKey, getProviderRpcUrl, getRouterConfig } from "./utils";
-import { Wallet, providers, utils, constants } from "ethers";
-import { IRouterClient, IRouterClient__factory, IERC20, IERC20__factory } from "../typechain-types";
-import { Spinner } from "../utils/spinner";
+import { getPrivateKey, getProviderRpcUrl, getRouterConfig } from "../helpers/utils";
+import { Wallet, JsonRpcProvider, id, AbiCoder, ZeroAddress } from "ethers";
+import {
+  IRouterClient,
+  IRouterClient__factory,
+  IERC20,
+  IERC20__factory,
+} from "../typechain-types";
+import { Spinner } from "../helpers/spinner";
 import { getCcipMessageId } from "./helpers";
 
-task(`ccip-token-transfer`, `Transfers tokens from one blockchain to another using Chainlink CCIP`)
-    .addParam(`sourceBlockchain`, `The name of the source blockchain (for example ethereumSepolia)`)
-    .addParam(`destinationBlockchain`, `The name of the destination blockchain (for example polygonMumbai)`)
-    .addParam(`receiver`, `The address of the receiver account on the destination blockchain`)
-    .addParam(`tokenAddress`, `The address of a token to be sent on the source blockchain`)
-    .addParam(`amount`, `The amount of token to be sent in units (eg wei, satoshi, etc))`)
-    .addOptionalParam(`feeTokenAddress`, `The address of token for paying fees. If not provided, the source blockchain's native coin will be used`)
-    .addOptionalParam(`router`, `The address of the Router contract on the source blockchain`)
-    .addOptionalParam(`gasLimit`, `The maximum amount of gas CCIP can consume to execute ccipReceive() on the contract located on the destination blockchain. Unspent gas will not be refunded. Should be 0 for transfer to EOA.`)
-    .setAction(async (taskArguments: TaskArguments) => {
-        const { sourceBlockchain, destinationBlockchain, receiver, tokenAddress, amount, feeTokenAddress, gasLimit } = taskArguments;
+task(
+  `ccip-token-transfer`,
+  `Transfers tokens from one blockchain to another using Chainlink CCIP`
+)
+  .addParam(
+    `sourceBlockchain`,
+    `The name of the source blockchain (for example ethereumSepolia)`
+  )
+  .addParam(
+    `destinationBlockchain`,
+    `The name of the destination blockchain (for example polygonAmoy)`
+  )
+  .addParam(
+    `receiver`,
+    `The address of the receiver account on the destination blockchain`
+  )
+  .addParam(
+    `tokenAddress`,
+    `The address of a token to be sent on the source blockchain`
+  )
+  .addParam(
+    `amount`,
+    `The amount of token to be sent in units (eg wei, satoshi, etc))`
+  )
+  .addOptionalParam(
+    `feeTokenAddress`,
+    `The address of token for paying fees. If not provided, the source blockchain's native coin will be used`
+  )
+  .addOptionalParam(
+    `router`,
+    `The address of the Router contract on the source blockchain`
+  )
+  .addOptionalParam(
+    `gasLimit`,
+    `The maximum amount of gas CCIP can consume to execute ccipReceive() on the contract located on the destination blockchain. Unspent gas will not be refunded. Should be 0 for transfer to EOA.`
+  )
+  .setAction(async (taskArguments: TaskArguments) => {
+    const {
+      sourceBlockchain,
+      destinationBlockchain,
+      receiver,
+      tokenAddress,
+      amount,
+      feeTokenAddress,
+      gasLimit,
+    } = taskArguments;
 
-        const privateKey = getPrivateKey();
-        const sourceRpcProviderUrl = getProviderRpcUrl(sourceBlockchain);
+    const privateKey = getPrivateKey();
+    const sourceRpcProviderUrl = getProviderRpcUrl(sourceBlockchain);
 
-        const provider = new providers.JsonRpcProvider(sourceRpcProviderUrl);
-        const wallet = new Wallet(privateKey);
-        const signer = wallet.connect(provider);
+    const provider = new JsonRpcProvider(sourceRpcProviderUrl);
+    const wallet = new Wallet(privateKey);
+    const signer = wallet.connect(provider);
 
-        const spinner: Spinner = new Spinner();
+    const spinner: Spinner = new Spinner();
 
-        const routerAddress = taskArguments.router ? taskArguments.router : getRouterConfig(sourceBlockchain).address;
-        const targetChainSelector = getRouterConfig(destinationBlockchain).chainSelector;
+    const routerAddress = taskArguments.router
+      ? taskArguments.router
+      : getRouterConfig(sourceBlockchain).address;
+    const targetChainSelector = getRouterConfig(
+      destinationBlockchain
+    ).chainSelector;
 
-        const router: IRouterClient = IRouterClient__factory.connect(routerAddress, signer);
-        const supportedTokens = await router.getSupportedTokens(targetChainSelector);
+    const router: IRouterClient = IRouterClient__factory.connect(
+      routerAddress,
+      signer
+    );
 
-        console.log(`ℹ️  Checking whether the ${tokenAddress} token is supported by Chainlink CCIP on the ${sourceBlockchain} blockchain`);
-        spinner.start();
+    const tokenToSend: IERC20 = IERC20__factory.connect(tokenAddress, signer);
 
-        if (!supportedTokens.includes(tokenAddress)) {
-            spinner.stop();
-            console.error(`❌ Token address ${tokenAddress} not in the list of supportedTokens ${supportedTokens}`);
-            return 1;
-        }
+    console.log(
+      `ℹ️  Attempting to approve Router smart contract (${routerAddress}) to spend ${amount} of ${tokenAddress} tokens on behalf of ${signer.address}`
+    );
+    spinner.start();
 
-        spinner.stop();
-        console.log(`✅ Token ${tokenAddress} is supported by Chainlink CCIP on the ${sourceBlockchain} blockchain`);
+    const approvalTx = await tokenToSend.approve(routerAddress, amount);
+    await approvalTx.wait();
 
-        const tokenToSend: IERC20 = IERC20__factory.connect(tokenAddress, signer);
+    spinner.stop();
+    console.log(
+      `✅ Approved successfully, transaction hash: ${approvalTx.hash}`
+    );
 
-        console.log(`ℹ️  Attempting to approve Router smart contract (${routerAddress}) to spend ${amount} of ${tokenAddress} tokens on behalf of ${signer.address}`);
-        spinner.start();
+    const tokenAmounts = [
+      {
+        token: tokenAddress,
+        amount: amount,
+      },
+    ];
 
-        const approvalTx = await tokenToSend.approve(routerAddress, amount);
-        await approvalTx.wait();
+    const gasLimitValue = taskArguments.gasLimit
+      ? taskArguments.gasLimit
+      : 200_000;
 
-        spinner.stop();
-        console.log(`✅ Approved successfully, transaction hash: ${approvalTx.hash}`);
+    const functionSelector = id("CCIP EVMExtraArgsV1").slice(0, 10);
+    const defaultAbiCoder = AbiCoder.defaultAbiCoder();
+    const extraArgs = defaultAbiCoder.encode(["uint256"], [gasLimitValue]); // for transfers to EOA gas limit is 0
+    const encodedExtraArgs = `${functionSelector}${extraArgs.slice(2)}`;
 
-        const tokenAmounts = [
-            {
-                token: tokenAddress,
-                amount: amount,
-            },
-        ];
+    const message = {
+      receiver: defaultAbiCoder.encode(["address"], [receiver]),
+      data: defaultAbiCoder.encode(["string"], [""]), // no data
+      tokenAmounts: tokenAmounts,
+      feeToken: feeTokenAddress ? feeTokenAddress : ZeroAddress,
+      extraArgs: encodedExtraArgs,
+    };
 
-        const gasLimitValue = taskArguments.gasLimit ? taskArguments.gasLimit : 200_000;
+    console.log(`ℹ️  Calculating CCIP fees...`);
+    spinner.start();
 
-        const functionSelector = utils.id("CCIP EVMExtraArgsV1").slice(0, 10);
-        const extraArgs = utils.defaultAbiCoder.encode(["uint256", "bool"], [gasLimitValue, false]); // for transfers to EOA gas limit is 0
-        const encodedExtraArgs = `${functionSelector}${extraArgs.slice(2)}`;
+    const fees = await router.getFee(targetChainSelector, message);
 
-        const message = {
-            receiver: utils.defaultAbiCoder.encode(["address"], [receiver]),
-            data: utils.defaultAbiCoder.encode(["string"], [""]), // no data
-            tokenAmounts: tokenAmounts,
-            feeToken: feeTokenAddress ? feeTokenAddress : constants.AddressZero,
-            extraArgs: encodedExtraArgs,
-        };
+    if (feeTokenAddress) {
+      spinner.stop();
+      console.log(`ℹ️  Estimated fees (juels): ${fees}`);
 
-        console.log(`ℹ️  Calculating CCIP fees...`);
-        spinner.start();
+      const supportedFeeTokens = getRouterConfig(sourceBlockchain).feeTokens;
 
-        const fees = await router.getFee(targetChainSelector, message);
+      if (!supportedFeeTokens.includes(feeTokenAddress)) {
+        console.error(
+          `❌ Token address ${feeTokenAddress} not in the list of supportedTokens ${supportedFeeTokens}`
+        );
+        return 1;
+      }
 
-        if (feeTokenAddress) {
-            spinner.stop();
-            console.log(`ℹ️  Estimated fees (juels): ${fees}`);
+      const feeToken: IERC20 = IERC20__factory.connect(feeTokenAddress, signer);
 
-            const supportedFeeTokens = getRouterConfig(sourceBlockchain).feeTokens;
+      console.log(
+        `ℹ️  Attempting to approve Router smart contract (${routerAddress}) to spend ${fees} of ${feeTokenAddress} tokens for Chainlink CCIP fees on behalf of ${signer.address}`
+      );
+      spinner.start();
 
-            if (!supportedFeeTokens.includes(feeTokenAddress)) {
-                console.error(`❌ Token address ${feeTokenAddress} not in the list of supportedTokens ${supportedFeeTokens}`);
-                return 1;
-            }
+      const approvalTx = await feeToken.approve(routerAddress, fees);
+      await approvalTx.wait();
 
-            const feeToken: IERC20 = IERC20__factory.connect(feeTokenAddress, signer);
+      spinner.stop();
+      console.log(
+        `✅ Approved successfully, transaction hash: ${approvalTx.hash}`
+      );
 
-            console.log(`ℹ️  Attempting to approve Router smart contract (${routerAddress}) to spend ${fees} of ${feeTokenAddress} tokens for Chainlink CCIP fees on behalf of ${signer.address}`);
-            spinner.start();
+      console.log(
+        `ℹ️  Attempting to send ${amount} of ${tokenAddress} tokens from the ${sourceBlockchain} blockchain to ${receiver} address on the ${destinationBlockchain} blockchain`
+      );
+      spinner.start();
 
-            const approvalTx = await feeToken.approve(routerAddress, fees);
-            await approvalTx.wait();
+      const sendTx = await router.ccipSend(targetChainSelector, message);
+      const receipt = await sendTx.wait();
 
-            spinner.stop();
-            console.log(`✅ Approved successfully, transaction hash: ${approvalTx.hash}`);
+      spinner.stop();
+      console.log(`✅ Sent successfully! Transaction hash: ${sendTx.hash}`);
 
-            console.log(`ℹ️  Attempting to send ${amount} of ${tokenAddress} tokens from the ${sourceBlockchain} blockchain to ${receiver} address on the ${destinationBlockchain} blockchain`);
-            spinner.start();
+      await getCcipMessageId(sendTx, receipt, provider);
+    } else {
+      spinner.stop();
+      console.log(`ℹ️  Estimated fees (wei): ${fees}`);
 
-            const sendTx = await router.ccipSend(targetChainSelector, message);
-            const receipt = await sendTx.wait();
+      console.log(
+        `ℹ️  Attempting to send ${amount} of ${tokenAddress} tokens from the ${sourceBlockchain} blockchain to ${receiver} address on the ${destinationBlockchain} blockchain`
+      );
+      spinner.start();
 
-            spinner.stop()
-            console.log(`✅ Sent successfully! Transaction hash: ${sendTx.hash}`);
+      const sendTx = await router.ccipSend(targetChainSelector, message, {
+        value: fees,
+      });
+      const receipt = await sendTx.wait();
 
-            await getCcipMessageId(sendTx, receipt, provider);
+      spinner.stop();
+      console.log(`✅ Sent successfully! Transaction hash: ${sendTx.hash}`);
 
-        } else {
-            spinner.stop();
-            console.log(`ℹ️  Estimated fees (wei): ${fees}`);
+      await getCcipMessageId(sendTx, receipt, provider);
+    }
 
-            console.log(`ℹ️  Attempting to send ${amount} of ${tokenAddress} tokens from the ${sourceBlockchain} blockchain to ${receiver} address on the ${destinationBlockchain} blockchain`);
-            spinner.start();
-
-            const sendTx = await router.ccipSend(targetChainSelector, message, { value: fees });
-            const receipt = await sendTx.wait();
-
-            spinner.stop()
-            console.log(`✅ Sent successfully! Transaction hash: ${sendTx.hash}`);
-
-            await getCcipMessageId(sendTx, receipt, provider);
-        }
-
-        console.log(`✅ Task ccip-token-transfer finished with the execution`);
-    });
+    console.log(`✅ Task ccip-token-transfer finished with the execution`);
+  });
